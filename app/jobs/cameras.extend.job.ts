@@ -48,6 +48,25 @@ export default class ExtendCameraStreamAuthenticationJob extends CronJob {
               name: camera.name,
               error,
             })
+            // Soft pm3.restart is not enough: workers can look "alive" while publishing
+            // frozen/connecting frames after an invalid streamExtensionToken. Clear the
+            // token and hard-recycle the nestmtx:stream worker so Generate*Stream runs.
+            if (!camera.mtxPath) {
+              logger.error(
+                `Cannot recycle stream process for camera "${camera.name}" (${camera.id}): mtxPath is null`
+              )
+            } else {
+              try {
+                await this.#app.streamer.recycleStream(
+                  camera.mtxPath,
+                  `sdm extend failed: ${(error as Error).message}`
+                )
+              } catch (recycleError) {
+                logger.error(
+                  `Failed to hard-recycle stream process for camera "${camera.name}": ${(recycleError as Error).message}`
+                )
+              }
+            }
           }
         } else {
           logger.info(

@@ -39,6 +39,10 @@ export class StreamerService {
   readonly #internalApiPort: number
   readonly #logger: winston.Logger
   readonly #lastDataCounts: Map<string, number>
+  readonly #stallCounts: Map<string, number>
+  readonly #lastRecycleAt: Map<string, number>
+  readonly #recycleCooldownMs: number
+  readonly #stallEscalateAfter: number
 
   #ffmpegHwAccelerator?: string
   #ffmpegHwAcceleratorDevice?: string
@@ -52,6 +56,12 @@ export class StreamerService {
     this.#internalApiPort = env.get('INTERNAL_API_PORT', 62005)
     this.#logger = main.child({ service: 'streamer' })
     this.#lastDataCounts = new Map()
+    this.#stallCounts = new Map()
+    this.#lastRecycleAt = new Map()
+    // Avoid thrashing Google SDM / MediaMTX if a path is hard-down.
+    this.#recycleCooldownMs = 60_000
+    // Soft stall first; hard-recycle after consecutive no-progress observations.
+    this.#stallEscalateAfter = 2
   }
 
   get managedProcesses() {
@@ -152,23 +162,104 @@ export class StreamerService {
     /**
      * For all live paths that are streaming, check that the amount of data received is continuing to increase.
      * If the amount of data received is not increasing, then the stream is stalled and should be restarted.
+     *
+     * Soft stall first (notify stream workers). If the path keeps stalling, escalate to a hard
+     * recycle: clear the SDM stream token and force a new nestmtx:stream worker. Soft stalls alone
+     * are not enough when the Node worker is alive but publishing frozen/placeholder video.
      */
     const paths = this.#app.mediamtx.getPaths()
     const livePaths = paths.filter((path) => path.ready)
-    livePaths.forEach((path) => {
+    for (const path of livePaths) {
       const last = this.#lastDataCounts.get(path.path)
       if ('number' === typeof last && last >= path.dataRx) {
+        const stalls = (this.#stallCounts.get(path.path) || 0) + 1
+        this.#stallCounts.set(path.path, stalls)
         this.#logger.warning(
-          `Stream for path "${path.path}" is stalled, based on data transmission statistics`
+          `Stream for path "${path.path}" is stalled, based on data transmission statistics (stall #${stalls})`
         )
         if (this.#internalApiServer) {
           this.#internalApiServer.emit(`${path.path}:stall`)
           this.#logger.info(`Sent ${path.path}:stall to processes for path "${path.path}"`)
-          this.#lastDataCounts.set(path.path, path.dataRx)
         }
+        if (stalls >= this.#stallEscalateAfter) {
+          try {
+            await this.recycleStream(path.path, `stalled dataRx x${stalls}`)
+            this.#stallCounts.set(path.path, 0)
+          } catch (error) {
+            this.#logger.error(
+              `Failed hard-recycle for stalled path "${path.path}": ${(error as Error).message}`
+            )
+          }
+        }
+      } else {
+        this.#stallCounts.set(path.path, 0)
       }
       this.#lastDataCounts.set(path.path, path.dataRx)
-    })
+    }
+  }
+
+  /**
+   * Force a clean slate for a MediaMTX path:
+   * 1) Invalidate the cached SDM stream extension token so Generate*Stream is used next
+   * 2) Hard-kill any pm3 worker for the path (even if bookkeeping is inconsistent)
+   * 3) Start a fresh nestmtx:stream worker
+   */
+  async recycleStream(path: string, reason: string = 'manual') {
+    const processName = this.#getMtxProcessName(path)
+    const now = Date.now()
+    const last = this.#lastRecycleAt.get(path) || 0
+    if (now - last < this.#recycleCooldownMs) {
+      this.#logger.warning(
+        `Skipping recycle for path "${path}" (${reason}); cooldown ${this.#recycleCooldownMs}ms active`
+      )
+      return false
+    }
+    this.#lastRecycleAt.set(path, now)
+    this.#logger.warning(`Hard-recycling stream for path "${path}" (${reason})`)
+
+    let camera: Camera | null = null
+    try {
+      camera = await Camera.findBy({ mtx_path: path })
+    } catch {
+      camera = null
+    }
+
+    if (camera) {
+      const hadToken = Boolean(camera.streamExtensionToken)
+      camera.streamExtensionToken = null
+      camera.expiresAt = null
+      try {
+        await camera.save()
+        if (hadToken) {
+          this.#logger.info(
+            `Cleared stale SDM stream token for camera "${camera.name}" (${camera.id}) path "${path}"`
+          )
+        }
+        this.#app.bus.publish('camera', 'recycled', camera.id, {
+          name: camera.name,
+          path,
+          reason,
+        })
+      } catch (error) {
+        this.#logger.error(
+          `Failed to clear stream token for camera "${camera.name}" (${camera.id}): ${(error as Error).message}`
+        )
+      }
+    }
+
+    await this.#app.pm3.hardRecycle(
+      processName,
+      {
+        file: 'node',
+        arguments: ['ace', 'nestmtx:stream', path, this.#internalApiPort!.toString()],
+        restart: true,
+      },
+      true
+    )
+    this.#stallCounts.set(path, 0)
+    this.#lastDataCounts.delete(path)
+    this.#logger.info(`Hard-recycled process "${processName}" for path "${path}"`)
+    return true
   }
 
   async #getAvailableHwAccelerators() {
@@ -251,8 +342,10 @@ export class StreamerService {
     const process = this.#app.pm3.get(processName)
     let doStart = false
     if (process) {
-      if (process.exitCode === null && 'undefined' !== typeof process.pid) {
-        // the process is alive and well
+      // Treat only truly-running children as alive. A finished Execa handle with
+      // exitCode set used to block restarts indefinitely ("zombie worker").
+      const alive = process.exitCode === null && 'number' === typeof process.pid
+      if (alive) {
         this.#logger?.info(
           `"${payload.MTX_PATH}" already has a running process with PID "${process.pid}"`
         )
