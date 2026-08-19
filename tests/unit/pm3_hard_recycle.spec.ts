@@ -66,6 +66,11 @@ test.group('PM3 hard recycle', (group) => {
   test('stop on unknown name still throws PM3NoSuchProcess', async ({ assert }) => {
     const pm3 = new PM3()
     live.push(pm3)
-    await assert.rejects(async () => pm3.stop('nope'), PM3NoSuchProcess)
+    try {
+      await pm3.stop('nope')
+      assert.fail('expected PM3NoSuchProcess')
+    } catch (error) {
+      assert.instanceOf(error, PM3NoSuchProcess)
+    }
   })
 })
