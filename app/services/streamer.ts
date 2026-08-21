@@ -12,6 +12,11 @@ import type { NATService } from '#services/nat'
 import type { ICEService } from '#services/ice'
 import type { IPCService } from '#services/ipc'
 import type winston from 'winston'
+import {
+  NULL_TOKEN_GRACE_MS,
+  decideStallRecycle,
+  decideUnhealthyWorkerRecycle,
+} from '#utilities/stream_recycle_policy'
 
 interface DemandEventPayload {
   MTX_PATH: string
@@ -41,8 +46,11 @@ export class StreamerService {
   readonly #lastDataCounts: Map<string, number>
   readonly #stallCounts: Map<string, number>
   readonly #lastRecycleAt: Map<string, number>
+  readonly #unhealthySince: Map<string, number>
+  readonly #placeholderPaths: Set<string>
   readonly #recycleCooldownMs: number
   readonly #stallEscalateAfter: number
+  readonly #nullTokenGraceMs: number
 
   #ffmpegHwAccelerator?: string
   #ffmpegHwAcceleratorDevice?: string
@@ -58,10 +66,14 @@ export class StreamerService {
     this.#lastDataCounts = new Map()
     this.#stallCounts = new Map()
     this.#lastRecycleAt = new Map()
+    this.#unhealthySince = new Map()
+    this.#placeholderPaths = new Set()
     // Avoid thrashing Google SDM / MediaMTX if a path is hard-down.
     this.#recycleCooldownMs = 60_000
     // Soft stall first; hard-recycle after consecutive no-progress observations.
     this.#stallEscalateAfter = 2
+    // Generate*Stream is allowed this long before a null-token/placeholder worker is recycled.
+    this.#nullTokenGraceMs = NULL_TOKEN_GRACE_MS
   }
 
   get managedProcesses() {
@@ -153,6 +165,19 @@ export class StreamerService {
         ...this.#app.natService.lanIps,
         this.#app.natService.publicIp,
       ])
+      socket.on('placeholder', (path: unknown) => {
+        if ('string' === typeof path && path.length > 0) {
+          this.#placeholderPaths.add(path)
+          this.#logger.info(`Path "${path}" is publishing placeholder video`)
+        }
+      })
+      socket.on('live', (path: unknown) => {
+        if ('string' === typeof path && path.length > 0) {
+          this.#placeholderPaths.delete(path)
+          this.#unhealthySince.delete(path)
+          this.#logger.info(`Path "${path}" is publishing live camera video`)
+        }
+      })
     })
     this.#internalApiServer.listen(this.#internalApiPort)
     this.#logger.info(`Streamer Service API listening on port ${this.#internalApiPort}`)
@@ -160,42 +185,98 @@ export class StreamerService {
 
   async cronjob() {
     /**
-     * For all live paths that are streaming, check that the amount of data received is continuing to increase.
-     * If the amount of data received is not increasing, then the stream is stalled and should be restarted.
-     *
-     * Soft stall first (notify stream workers). If the path keeps stalling, escalate to a hard
-     * recycle: clear the SDM stream token and force a new nestmtx:stream worker. Soft stalls alone
-     * are not enough when the Node worker is alive but publishing frozen/placeholder video.
+     * Inspect every known MediaMTX path, not just ready ones.
+     * A not-ready path with a live worker is how the side doorbell sat dead
+     * for hours. A ready path with rising dataRx can still be connecting.jpg.
      */
     const paths = this.#app.mediamtx.getPaths()
-    const livePaths = paths.filter((path) => path.ready)
-    for (const path of livePaths) {
-      const last = this.#lastDataCounts.get(path.path)
-      if ('number' === typeof last && last >= path.dataRx) {
-        const stalls = (this.#stallCounts.get(path.path) || 0) + 1
-        this.#stallCounts.set(path.path, stalls)
+    for (const path of paths) {
+      const stall = decideStallRecycle({
+        pathReady: path.ready,
+        dataRx: path.dataRx,
+        lastDataRx: this.#lastDataCounts.get(path.path),
+        stallCount: this.#stallCounts.get(path.path) || 0,
+        stallEscalateAfter: this.#stallEscalateAfter,
+      })
+      this.#stallCounts.set(path.path, stall.nextStallCount)
+      if (stall.nextStallCount > 0) {
         this.#logger.warning(
-          `Stream for path "${path.path}" is stalled, based on data transmission statistics (stall #${stalls})`
+          `Stream for path "${path.path}" is stalled, based on data transmission statistics (stall #${stall.nextStallCount})`
         )
         if (this.#internalApiServer) {
           this.#internalApiServer.emit(`${path.path}:stall`)
           this.#logger.info(`Sent ${path.path}:stall to processes for path "${path.path}"`)
         }
-        if (stalls >= this.#stallEscalateAfter) {
-          try {
-            await this.recycleStream(path.path, `stalled dataRx x${stalls}`)
-            this.#stallCounts.set(path.path, 0)
-          } catch (error) {
-            this.#logger.error(
-              `Failed hard-recycle for stalled path "${path.path}": ${(error as Error).message}`
-            )
-          }
-        }
-      } else {
-        this.#stallCounts.set(path.path, 0)
       }
       this.#lastDataCounts.set(path.path, path.dataRx)
+
+      if (stall.recycle && stall.reason) {
+        try {
+          await this.recycleStream(path.path, stall.reason)
+        } catch (error) {
+          this.#logger.error(
+            `Failed hard-recycle for stalled path "${path.path}": ${(error as Error).message}`
+          )
+        }
+        continue
+      }
+
+      try {
+        await this.recycleIfUnhealthy(path.path)
+      } catch (error) {
+        this.#logger.error(
+          `Failed unhealthy-worker check for path "${path.path}": ${(error as Error).message}`
+        )
+      }
     }
+  }
+
+  /**
+   * Recycle a live worker that is sitting on a null SDM token or connecting.jpg
+   * after the startup grace window. Safe to call from extend, demand, and cron.
+   */
+  async recycleIfUnhealthy(path: string) {
+    let camera: Camera | null = null
+    try {
+      camera = await Camera.findBy({ mtx_path: path })
+    } catch {
+      return false
+    }
+    if (!camera || !camera.isEnabled) {
+      return false
+    }
+
+    const processName = this.#getMtxProcessName(path)
+    const process = this.#app.pm3.get(processName)
+    const workerAlive = Boolean(
+      process && process.exitCode === null && 'number' === typeof process.pid
+    )
+    const hasStreamToken = Boolean(camera.streamExtensionToken)
+    const publishingPlaceholder = this.#placeholderPaths.has(path)
+    const now = Date.now()
+    const unhealthy = (!hasStreamToken && workerAlive) || (publishingPlaceholder && workerAlive)
+    if (unhealthy) {
+      if (!this.#unhealthySince.has(path)) {
+        this.#unhealthySince.set(path, now)
+      }
+    } else {
+      this.#unhealthySince.delete(path)
+    }
+
+    const unhealthySince = this.#unhealthySince.get(path)
+    const decision = decideUnhealthyWorkerRecycle({
+      enabled: camera.isEnabled,
+      hasStreamToken,
+      workerAlive,
+      publishingPlaceholder,
+      unhealthySinceMs: 'number' === typeof unhealthySince ? now - unhealthySince : null,
+      cooldownActive: now - (this.#lastRecycleAt.get(path) || 0) < this.#recycleCooldownMs,
+      graceMs: this.#nullTokenGraceMs,
+    })
+    if (!decision.recycle) {
+      return false
+    }
+    return this.recycleStream(path, decision.reason)
   }
 
   /**
@@ -258,6 +339,8 @@ export class StreamerService {
     )
     this.#stallCounts.set(path, 0)
     this.#lastDataCounts.delete(path)
+    this.#unhealthySince.delete(path)
+    this.#placeholderPaths.delete(path)
     this.#logger.info(`Hard-recycled process "${processName}" for path "${path}"`)
     return true
   }
@@ -349,6 +432,13 @@ export class StreamerService {
         this.#logger?.info(
           `"${payload.MTX_PATH}" already has a running process with PID "${process.pid}"`
         )
+        try {
+          await this.recycleIfUnhealthy(payload.MTX_PATH)
+        } catch (error) {
+          this.#logger?.error(
+            `Failed unhealthy-worker check on demand for "${payload.MTX_PATH}": ${(error as Error).message}`
+          )
+        }
       } else {
         this.#logger?.info(`The process for "${payload.MTX_PATH}" is dead and will be restarted`)
         await this.#app.pm3.remove(processName)
